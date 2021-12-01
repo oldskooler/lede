@@ -8,8 +8,9 @@
 name: OpenWrt-CI
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: 0 20 * * *
+    - cron: 30 20 * * 5
   release:
     types: [published]
 
@@ -46,7 +47,9 @@ jobs:
 
       - name: Update feeds
         run: |
-          sed -i 's/#src-git helloworld/src-git helloworld/g' ./feeds.conf.default
+          # sed -i 's/#src-git helloworld/src-git helloworld/g' ./feeds.conf.default
+          sed -i "/helloworld/d" "feeds.conf.default"
+          echo "src-git helloworld https://github.com/fw876/helloworld.git" >> "feeds.conf.default"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
