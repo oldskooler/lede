@@ -5,12 +5,15 @@
 #
 # Copyright (C) 2020 KFERMercer
 #
-name: OpenWrt-CI
+name: OpenWrt-CI_My
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: 0 20 * * 6
-
+    - cron: 30 20 * * 5
+  release:
+    types: [published]
+    
 permissions:
   contents: read
 
@@ -45,11 +48,15 @@ jobs:
       - name: Update feeds
         run: |
           sed -i 's/#src-git helloworld/src-git helloworld/g' ./feeds.conf.default
+          sed -i "/helloworld/d" "feeds.conf.default"
+          echo "src-git helloworld https://github.com/fw876/helloworld.git" >> "feeds.conf.default"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
       - name: Generate configuration file
-        run: make defconfig
+        run: |
+          cp ./makeconfig.d/x86_64.config ./.config
+          make defconfig
 
       - name: Download packages
         run: make download -j16
