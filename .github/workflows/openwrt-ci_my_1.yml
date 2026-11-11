@@ -1,68 +1,51 @@
+# ============================================================
+#  OpenWrt CI  ——  x86_64 固件自动编译
+#  基于 KFERMercer/OpenWrt-CI 改造
 #
-# OpenWrt CI - Fixed Workflow
-# 基于 KFERMercer/OpenWrt-CI，修复以下问题：
-#   1. clang/clang++ 缺失导致 feeds/helloworld/gn 编译失败（本次报错根因）
-#   2. clang 版本过低不支持 -std=c++23（gn 需要 clang >= 15，这里固定 clang-17）
-#   3. feeds.conf.default 中 helloworld 源被重复追加
-#   4. 无 ccache / dl 缓存，每次全量编译耗时 1~3 小时
-#   5. apt 步骤内 purge llvm* 与 install clang 自相矛盾、autoremove --purge 误删依赖
-#   6. 产物仅上传 Artifact（90 天过期），改为可选自动发布 Release
-#
+# ============================================================
+
 name: OpenWrt-CI_My_1
 
 on:
   workflow_dispatch:
     inputs:
-      upload_release:
-        description: '编译成功后是否发布为 Release（true 需 contents: write 权限）'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+      release:
+        description: '编译完成后发布为 Release'
+        type: boolean
+        default: false
   schedule:
-    # UTC 20:30 周五 == 北京时间周六 04:30
-    - cron: 30 20 * * 5
+    - cron: 30 20 * * 5      # UTC，即北京时间周六 04:30
   release:
     types: [published]
 
-# 默认只读；若要用 Release 发布，请把 contents 改为 write
+# 若要用「发布 Release」功能，把 read 改成 write
+
 permissions:
-  contents: read
+  contents: write
 
 env:
-  # 固定 clang 大版本，gn / naiveproxy / xray 均依赖它
-  CLANG_VER: 17
-  # ccache 缓存上限
-  CCACHE_DIR: /home/runner/work/ccache
-  CCACHE_MAXSIZE: 8G
+  CLANG_VER: 15
+  CONFIG_FILE: makeconfig.d/x86_64.config
 
 jobs:
-
   build_openwrt:
-
     name: Build OpenWrt Firmware
-
     runs-on: ubuntu-22.04
 
     steps:
-      # ────────────────────────────────────────────────
-      # 1. 清理磁盘 + 安装基础编译依赖
-      #    注意：此处不再安装 clang/llvm，交给第 5 步统一处理，
-      #    避免被后面的 free-disk-space 与 autoremove 误删。
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Space cleanup and Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker image prune -f || true
-          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          docker image prune -f
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php \
+                         /usr/local/lib/android
           sudo -E apt-mark hold grub-efi-amd64-signed
           sudo -E apt update
-          # 只清真正用不到的重型套件，不要 purge llvm*（clang 依赖它）
-          sudo -E apt -y purge azure-cli* docker* ghc* zulu* firefox google* \
-                              dotnet* powershell* openjdk* mysql* php* mongodb* snap* || true
+          sudo -E apt -y purge azure-cli* docker* ghc* zulu* firefox \
+                             google* dotnet* powershell* openjdk* mysql* \
+                             php* mongodb* snap*
           sudo -E apt -y full-upgrade
           sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint \
             binutils bison build-essential bzip2 ccache cmake cpio curl \
@@ -71,268 +54,317 @@ jobs:
             libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
             libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
             libpython3-dev libreadline-dev libssl-dev libtool lrzsz msmtp \
-            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools \
-            python3-setuptools qemu-utils rsync scons squashfs-tools subversion \
-            swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-          sudo -E apt -y autoremove
+            ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-pyelftools python3-setuptools qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zlib1g-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt -y autoremove          # 去掉 --purge，防误伤
           sudo -E apt clean
           sudo -E timedatectl set-timezone "Asia/Shanghai"
-          echo "========================"
-          echo "Disk after cleanup:"
-          df -h
-          echo "========================"
 
-      # ────────────────────────────────────────────────
-      # 2. 拉取源码（必须在 free-disk-space 之前，checkout 需要 git）
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Checkout OpenWrt
         uses: actions/checkout@v4
         with:
-          fetch-depth: 10
+          fetch-depth: 0
 
-      # ────────────────────────────────────────────────
-      # 3. 二次释放磁盘空间
-      #    tool-cache 关闭：防止误删 /opt/hostedtoolcache 里的工具链
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: false
+          tool-cache: false        # true 会删 hostedtoolcache，可能波及工具链
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: true
+          swap-storage: false      # swap 由下面独立步骤配置
 
-      # ────────────────────────────────────────────────
-      # 4. 追加 8G swap，防止链接阶段 OOM
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Setup swap
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 8G /swapfile_ci || sudo dd if=/dev/zero of=/swapfile_ci bs=1M count=8192 status=progress
+          sudo chmod 600 /swapfile_ci
+          sudo mkswap /swapfile_ci
+          sudo swapon /swapfile_ci
           free -h
 
-      # ────────────────────────────────────────────────
-      # 5. 【本次修复核心】安装并锁定 clang 工具链
-      #    gn 使用 -std=c++23，必须 clang >= 15；ubuntu-22.04 自带为 14，
-      #    故显式安装 clang-17 并覆盖 clang/clang++/lld 的符号链接。
-      #    放在 free-disk-space 之后，确保不会再被删掉。
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
+      # 关键修复：naiveproxy 虽已在 .config 关闭，仍保留 clang 作为保险
+      # （万一日后勾回 NaiveProxy / 加入其他需要 clang 的包）
       - name: 'Ensure clang toolchain (fix: clang++ not found)'
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get -y install --no-install-recommends \
-            clang-${CLANG_VER} clang-tools-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
+            clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}-dev libclang-${CLANG_VER}-dev
 
-          # 统一接管 clang / clang++ / ld.lld 名字
-          sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-${CLANG_VER}   100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${CLANG_VER} 100
-          sudo update-alternatives --install /usr/bin/lld     lld     /usr/bin/lld-${CLANG_VER}     100
-          sudo ln -sf /usr/bin/ld.lld-${CLANG_VER} /usr/bin/ld.lld
-          sudo ln -sf /usr/bin/clang-${CLANG_VER}  /usr/cc
-          hash -r
+          sudo update-alternatives --install /usr/bin/clang clang \
+               /usr/bin/clang-${CLANG_VER} 100 \
+               --slave /usr/bin/clang++ clang++ /usr/bin/clang++-${CLANG_VER} \
+               --slave /usr/bin/ld.lld    ld.lld  /usr/bin/lld-${CLANG_VER} \
+               --slave /usr/bin/llvm-ar   llvm-ar /usr/bin/llvm-ar-${CLANG_VER}
+          sudo update-alternatives --auto clang
 
-          echo "==================== clang sanity check ================"
+          echo "===== clang sanity check ====="
           which clang clang++ ld.lld
           clang++ --version
-          # 硬校验：任一缺失立即失败，不要等到编译 1 小时后才暴雷
-          clang++ -std=c++23 -x c++ - -o /tmp/t <<'EOF' || { echo "FATAL: clang++ cannot compile c++23"; exit 1; }
-          int main() { return 0; }
-          EOF
-          /tmp/t && echo "c++23 OK"
-          echo "========================================================"
+          # 真实编译测试：确认 -std=c++23 可用（gn 需要）
+          echo 'int main(){return 0;}' > /tmp/t.cc
+          clang++ -std=c++23 /tmp/t.cc -o /tmp/t && echo ">> C++23 OK"
+          ld.lld --version || true
 
-      # ────────────────────────────────────────────────
-      # 6. 缓存：ccache 编译产物 + dl 下载包
-      #    命中后增量编译可从 1~3 小时降到 10~30 分钟
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
+      # 若将来需要 clang-17，改用下面这段（jammy 源没有 17，必须加官方源）：
+      #   wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+      #   chmod +x /tmp/llvm.sh
+      #   sudo /tmp/llvm.sh 17
+      #   sudo apt-get -y install clang-17 lld-17 llvm-17-dev libclang-17-dev
+      #   sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 100 \
+      #     --slave /usr/bin/clang++ clang++ /usr/bin/clang++-17 \
+      #     --slave /usr/bin/ld.lld ld.lld /usr/bin/lld-17
+      # -------------------------------------------------------
+
+      # -------------------------------------------------------
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('makeconfig.d/*.config') }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ github.ref_name }}-
+            ccache-${{ runner.os }}-${{ hashFiles('makeconfig.d/*.config') }}-
             ccache-${{ runner.os }}-
 
-      - name: Cache dl
+      - name: Cache downloads
         uses: actions/cache@v4
         with:
-          path: ./dl
-          key: dl-${{ hashFiles('./feeds.conf.default', './makeconfig.d/x86_64.config') }}
-          restore-keys: dl-
+          path: dl
+          key: dl-${{ hashFiles('makeconfig.d/*.config') }}-${{ github.sha }}
+          restore-keys: |
+            dl-${{ hashFiles('makeconfig.d/*.config') }}-
+            dl-
 
-      - name: Configure ccache
-        run: |
-          mkdir -p "$CCACHE_DIR"
-          ccache --set-config=max_size=${CCACHE_MAXSIZE}
-          ccache --set-config=compression=true
-          ccache --set-config=hash_dir=false
-          ccache -z
-          echo "CCACHE_DIR=$CCACHE_DIR"
-          echo "CONFIG_CCACHE=y" >> "$GITHUB_ENV"
-
-      # ────────────────────────────────────────────────
-      # 7. 更新 feeds
-      #    修复：先删除任何已存在的 helloworld 行再追加，避免重复源
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Update feeds
         run: |
-          sed -i "/helloworld/d" ./feeds.conf.default
-          echo "src-git helloworld https://github.com/fw876/helloworld.git" >> ./feeds.conf.default
-          echo "--- feeds.conf.default ---"
+          # 先删掉任何已存在的 helloworld 行，再统一追加，避免重复源
+          sed -i '/helloworld/d' ./feeds.conf.default
+          echo 'src-git helloworld https://github.com/fw876/helloworld.git' >> ./feeds.conf.default
+          echo "===== feeds.conf.default ====="
           cat ./feeds.conf.default
-          echo "--------------------------"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ────────────────────────────────────────────────
-      # 8. 生成配置
-      #    defconfig 会自动补全依赖；再强制打开 ccache
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Generate configuration file
         run: |
-          cp ./makeconfig.d/x86_64.config ./.config
-          make defconfig
-          # 确保 ccache 生效（若 .config 里已显式关闭则跳过）
-          grep -q '^CONFIG_CCACHE=y' .config || sed -i 's/^# CONFIG_CCACHE is not set/CONFIG_CCACHE=y/' .config
-          make defconfig
-          echo "==== key options ===="
-          grep -E 'CONFIG_CCACHE|CONFIG_PACKAGE_naiveproxy|CONFIG_PACKAGE_luci-app-ssr-plus|CONFIG_TARGET_' .config | head -40
+          set -e
+          if [ ! -f "${CONFIG_FILE}" ]; then
+            echo "FATAL: ${CONFIG_FILE} 不存在，请检查仓库路径"
+            ls -R makeconfig.d || true
+            exit 1
+          fi
+          cp ./${CONFIG_FILE} ./.config
 
-      # ────────────────────────────────────────────────
-      # 9. 预下载源码包（网络问题提前暴露）
-      # ────────────────────────────────────────────────
+          # ---- 保险丝 1：彻底掐掉 NaiveProxy（gn/clang 依赖链源头）----
+          sed -i 's/^CONFIG_PACKAGE_naiveproxy=y/# CONFIG_PACKAGE_naiveproxy is not set/' .config
+          sed -i 's/^CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NaiveProxy=y/# CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NaiveProxy is not set/' .config
+
+          # ---- 保险丝 2：libustream 三选一，只留 mbedtls ----
+          sed -i 's/^CONFIG_PACKAGE_libustream-openssl=y/# CONFIG_PACKAGE_libustream-openssl is not set/' .config
+          sed -i 's/^CONFIG_PACKAGE_libustream-wolfssl=y/# CONFIG_PACKAGE_libustream-wolfssl is not set/' .config
+          grep -q '^CONFIG_PACKAGE_libustream-mbedtls=y' .config || \
+            echo 'CONFIG_PACKAGE_libustream-mbedtls=y' >> .config
+
+          make defconfig
+
+          # ---- 保险丝 3：所有 =n 必须写成 "is not set"，否则 defconfig 后不生效 ----
+          sed -i 's/^\(CONFIG_[A-Za-z0-9_]*\)=n$/# \1 is not set/' .config
+
+          # ---- 构建前断言：关键项不符合预期就直接失败，不浪费 1 小时 ----
+          echo "===== 关键配置自检 ====="
+          FAIL=0
+          chk() { # chk <模式> <应出现|不应出现> <说明>
+            if grep -q "$1" .config; then
+              [ "$2" = "应出现" ] && echo "  OK   $3" || { echo "  FAIL $3（本应关闭却为 y）"; FAIL=1; }
+            else
+              [ "$2" = "不应出现" ] && echo "  OK   $3（已关闭）" || { echo "  FAIL $3（缺失！）"; FAIL=1; }
+            fi
+          }
+          chk '^CONFIG_TARGET_x86_64=y'            应出现   "目标平台 x86_64"
+          chk '^CONFIG_PACKAGE_luci-app-ssr-plus=y' 应出现   "SSR-Plus 主包"
+          chk '^CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=y' 应出现 "Xray 内核"
+          chk 'naiveproxy'                          不应出现 "NaiveProxy（gn/clang 依赖源头）"
+          chk '^CONFIG_PACKAGE_libustream-mbedtls=y' 应出现  "libustream 后端 mbedtls"
+          chk '^CONFIG_PACKAGE_libustream-openssl=y' 不应出现 "libustream-openssl（重复符号）"
+          chk '^CONFIG_PACKAGE_libustream-wolfssl=y' 不应出现 "libustream-wolfssl（重复符号）"
+          echo "----- libustream / naiveproxy 实际状态 -----"
+          grep -E '^#?CONFIG_PACKAGE_(libustream|naiveproxy)' .config || true
+          [ "$FAIL" = "0" ] || { echo ">> 配置自检未通过，终止编译"; exit 1; }
+          echo ">> 配置自检通过"
+
+          # ---- 环境版本快照：事后排错不用重跑一遍 ----
+          echo "===== 工具链版本 ====="
+          clang++ --version 2>/dev/null | head -2 || echo "clang++ 缺失"
+          go version 2>/dev/null || echo "golang 尚未就位（feeds 阶段后才有）"
+          gcc --version | head -1
+          python3 --version
+          echo "===== SSR-Plus 启用的组件 ====="
+          grep -c 'ssr-plus_INCLUDE.*=y' .config
+
+          echo "===================== 自检 ====================="
+          echo "--- NaiveProxy 相关（应为空）---"
+          grep -E '^CONFIG_PACKAGE_(naiveproxy|luci-app-ssr-plus_INCLUDE_NaiveProxy)=y' .config && {
+            echo "FATAL: NaiveProxy 仍未关闭"; exit 1; } || echo "OK: NaiveProxy 已关闭"
+
+          echo "--- gn（应为空，gn 只为 naiveproxy 服务）---"
+          grep -E '^CONFIG_PACKAGE_gn' .config || echo "OK: gn 未进入编译队列"
+
+          echo "--- libustream（应只有 mbedtls）---"
+          grep '^CONFIG_PACKAGE_libustream' .config
+
+          echo "--- SSR-Plus 已启用组件 ---"
+          grep '^CONFIG_PACKAGE_luci-app-ssr-plus' .config
+
+      # -------------------------------------------------------
       - name: Download packages
         run: |
-          make download -j16 || make download -j8 || make download -j1
-          echo "dl size: $(du -sh ./dl | cut -f1)"
+          make download -j16
+          echo "--- dl 目录占用 ---"
+          du -sh dl 2>/dev/null || true
 
-      # ────────────────────────────────────────────────
-      # 10. 编译固件
-      #     多核起手 -> 失败降级 j1 V=s 输出完整错误
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
+      # -------------------------------------------------------
+      # xray-core / mihomo / hysteria / tuic 均为 Go 项目且要求 Go >= 1.22。
+      # 若你的 lede 分支自带旧 Go，xray 会在编译中段炸掉，这里提前拦住。
+      - name: Check Golang toolchain version
+        run: |
+          set -e
+          GO_BIN="$(command -v go || true)"
+          if [ -z "$GO_BIN" ]; then
+            echo ">> 尚未检测到 go（可能由 feeds 阶段准备），跳过预检"
+            exit 0
+          fi
+          V="$($GO_BIN version | awk '{print $3}')"
+          echo "当前 Go 版本: $V"
+          MAJ="$($GO_BIN version | awk '{print $3}' | sed -E 's/^go([0-9]+)\..*/\1/')"
+          MIN="$($GO_BIN version | awk '{print $3}' | sed -E 's/^go[0-9]+\.([0-9]+).*/\1/')"
+          echo ">> MAJ=$MAJ MIN=$MIN"
+          if [ "${MAJ:-0}" -gt 1 ] || { [ "${MAJ:-0}" -eq 1 ] && [ "${MIN:-0}" -ge 22 ]; }; then
+            echo ">> Go 版本满足 xray-core 要求 (>=1.22)"
+          else
+            echo "::warning::Go $V 低于 1.22，xray-core / mihomo 大概率编译失败。"
+            echo "::warning::请在 .config 提升 CONFIG_GOLANG_VERSION，或暂时关闭 Xray。"
+            echo "----- 参考：当前 .config 中的 golang 设置 -----"
+            grep -iE 'GOLANG|GO_VERSION' .config || echo "（.config 未显式声明 golang 版本，使用源码树默认值）"
+          fi
+
       - name: Compile firmware
         run: |
-          export CCACHE_DIR="${CCACHE_DIR}"
-          export PATH="/usr/lib/ccache:$PATH"
-          make -j$(nproc) || make -j1 V=s
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          ccache -M 5G || true
           ccache -s || true
+
+          make -j$(nproc) || make -j1 V=s
+
           echo "======================="
           echo "Space usage:"
           echo "======================="
           df -h
+          echo "======================="
           du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
           du -h --max-depth=1 ./build_dir
           du -h --max-depth=1 ./bin
+          echo "======================="
+          ccache -s || true
 
-      # ────────────────────────────────────────────────
-      # 11. 整理产物
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
       - name: Prepare artifact
         run: |
           set -e
-          rm -rf ./artifact && mkdir -p ./artifact/package ./artifact/buildinfo ./artifact/firmware
-          rm -rf $(find ./bin/targets/ -type d -name "packages")
+          mkdir -p ./artifact/package
+          mkdir -p ./artifact/buildinfo
+          mkdir -p ./artifact/firmware
 
-          # 固件镜像（img / vdi / vmdk / qcow2 / zip / tar.gz 等）
+          # 固件镜像（x86_64: img.gz / vdi / vmdk / iso 等）
           find ./bin/targets/ -type f \
-            \( -name "*.img.gz" -o -name "*.img" -o -name "*.vdi" -o -name "*.vmdk" \
-               -o -name "*.qcow2" -o -name "*.tar.gz" -o -name "*.zip" -o -name "*.manifest" \
-               -o -name "*.buildinfo" \) \
-            -exec cp -a {} ./artifact/firmware/ \;
+            \( -name "*.img.gz" -o -name "*.img" -o -name "*.vmdk" \
+               -o -name "*.vdi" -o -name "*.vhdx" -o -name "*.iso" \
+               -o -name "*-combined-*.tar.gz" -o -name "*manifest*" \) \
+            -exec cp -v {} ./artifact/firmware/ \;
 
-          # 所有 ipk 包
-          find ./bin/packages/ -type f -name "*.ipk" -exec cp -a {} ./artifact/package/ \; || true
-          # buildinfo / manifest
+          # ipk 软件包 + 构建清单
+          # 注意：先收集再删除；rm 的 $(find ...) 若为空会变成 `rm -rf` 裸调用，必须判空
+          PKGDIRS="$(find ./bin/targets/ -type d -name packages 2>/dev/null || true)"
+          if [ -n "$PKGDIRS" ]; then
+            echo ">> 清理 targets 下 packages 目录（不并入固件包）"
+            rm -rf $PKGDIRS
+          fi
+          cp -rf $(find ./bin/packages/ -type f -name "*.ipk" 2>/dev/null) ./artifact/package/ 2>/dev/null || echo "（无 ipk）"
           find ./bin/targets/ -type f \( -name "*.buildinfo" -o -name "*.manifest" \) \
-            -exec cp -a {} ./artifact/buildinfo/ \; || true
+            -exec cp -v {} ./artifact/buildinfo/ \; 2>/dev/null || echo "（无 buildinfo）"
 
-          echo "==== artifact ===="
-          du -sh ./artifact/*
-          ls -lR ./artifact | head -60
+          echo "===== artifact 内容 ====="
+          ls -lhR ./artifact | head -100
 
-      - name: Upload buildinfo
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_buildinfo
-          path: ./artifact/buildinfo/
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_package
-          path: ./artifact/package/
-          retention-days: 30
-          if-no-files-found: warn
-
+      # -------------------------------------------------------
       - name: Upload firmware
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: OpenWrt_firmware
           path: ./artifact/firmware/
-          retention-days: 90
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      # ────────────────────────────────────────────────
-      # 12. 可选：发布到 Release（需把顶部 permissions.contents 改为 write）
-      #     手动触发时选 upload_release=true 才执行
-      # ────────────────────────────────────────────────
-      - name: Generate release tag
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.upload_release == 'true' }}
-        id: tag
-        run: |
-          TAG="auto-$(TZ='Asia/Shanghai' date '+%Y%m%d-%H%M')"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
-
-      - name: Pack firmware for release
-        if: ${{ steps.tag.outputs.tag != '' }}
-        run: |
-          cd ./artifact/firmware
-          zip -q -r ../../OpenWrt-firmware-${{ steps.tag.outputs.tag }}.zip .
-          ls -lh ../../OpenWrt-firmware-*.zip
-
-      - name: Publish release
-        if: ${{ steps.tag.outputs.tag != '' }}
-        uses: softprops/action-gh-release@v2
+      - name: Upload package
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: OpenWrt Firmware ${{ steps.tag.outputs.tag }}
-          body: |
-            Automated build by GitHub Actions
+          name: OpenWrt_package
+          path: ./artifact/package/
+          if-no-files-found: warn
 
-            - Source: coolsnowwolf/lede + fw876/helloworld
-            - Config: makeconfig.d/x86_64.config
-            - Trigger: ${{ github.event_name }} by ${{ github.actor }}
-            - Clang: ${{ env.CLANG_VER }}
-          files: |
-            OpenWrt-firmware-${{ steps.tag.outputs.tag }}.zip
-            ./artifact/buildinfo/*
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload buildinfo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+          if-no-files-found: warn
 
-      # ────────────────────────────────────────────────
-      # 13. 失败兜底：把完整日志片段打出来，便于排查
-      # ────────────────────────────────────────────────
+      # -------------------------------------------------------
+      # 失败时把关键日志直接打到 CI 页面，省掉一次 V=s 重跑
       - name: Dump failure context
         if: failure()
         run: |
-          echo "=========== last build log ==========="
-          find ./logs -name "*.txt" 2>/dev/null | tail -5 | while read f; do
-            echo "--- $f ---"; tail -120 "$f"
+          echo "########## 最近 400 行日志 ##########"
+          find logs -type f -name "*.txt" 2>/dev/null | tail -5 | while read f; do
+            echo "=========== $f ==========="
+            tail -n 150 "$f"
           done
-          echo "=========== disk / mem ==========="
-          df -h; free -h
-          echo "=========== clang ==========="
-          which clang++ && clang++ --version || echo "clang++ MISSING"
+          echo "########## clang 状态 ##########"
+          which clang clang++ || echo "clang 缺失！"
+          clang++ --version 2>/dev/null || true
+          echo "########## gn 相关 ##########"
+          ls -l build_dir/hostpkg/ 2>/dev/null | grep -i gn || echo "无 gn 构建目录"
+          echo "########## 磁盘 ##########"
+          df -h
+
+      # -------------------------------------------------------
+      # 可选：手动触发且勾选 release 时自动发布
+      # 需把顶部 permissions 改为 contents: write
+      - name: Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: OpenWrt-x86_64-${{ github.run_number }}
+          name: OpenWrt x86_64 固件 ${{ github.run_number }}
+          body: |
+            自动编译产物
+            - 源码: ${{ github.repository }} @ ${{ github.sha }}
+            - 触发方式: ${{ github.event_name }} (by ${{ github.actor }})
+            - 运行编号: ${{ github.run_id }}
+            - 变更: SSR-Plus 全家桶（已关闭 NaiveProxy / gn，改用 clang-15）
+          files: ./artifact/firmware/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
